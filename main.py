@@ -9,6 +9,7 @@ import sys
 import typer
 import subprocess
 import requests
+import pandas as pd
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
@@ -45,7 +46,7 @@ GEOFABRIK_BASE_URL = "https://download.geofabrik.de"
 # Маппинг стран на поддиректории Geofabrik (континент/страна)
 # Полный список: https://download.geofabrik.de/
 COUNTRY_PATHS = {
-    "russia": "europe/russia",
+    "russia": "russia",
     "germany": "europe/germany",
     "france": "europe/france",
     "spain": "europe/spain",
@@ -73,29 +74,34 @@ COUNTRY_PATHS = {
 # Формат: "название страны": {"название региона": "путь-в-geofabrik"}
 REGION_PATHS = {
     "russia": {
-        "moscow": "russia/moscow",
-        "moskva": "russia/moscow",
-        "saint petersburg": "russia/northwestern-fedistrict",
-        "tula oblast": "russia/central-fedistrict",
-        "tula": "russia/central-fedistrict",
-        "moscow oblast": "russia/central-fedistrict",
-        "leningrad oblast": "russia/northwestern-fedistrict",
-        "crimea": "russia/crimean-fedistrict",
-        "siberia": "russia/siberian-fedistrict",
-        "ural": "russia/ural-fedistrict",
-        "far east": "russia/far-eastern-fedistrict",
+        # Отдельный экстракт Москвы на Geofabrik удалён — город входит в ЦФО
+        "moscow": "russia/central-fed-district",
+        "moskva": "russia/central-fed-district",
+        "saint petersburg": "russia/northwestern-fed-district",
+        "tula oblast": "russia/central-fed-district",
+        "tula": "russia/central-fed-district",
+        "moscow oblast": "russia/central-fed-district",
+        "leningrad oblast": "russia/northwestern-fed-district",
+        "kaliningrad": "russia/kaliningrad",
+        "crimea": "russia/crimean-fed-district",
+        "siberia": "russia/siberian-fed-district",
+        "ural": "russia/ural-fed-district",
+        "far east": "russia/far-eastern-fed-district",
+        "south": "russia/south-fed-district",
+        "north caucasus": "russia/north-caucasus-fed-district",
+        "volga": "russia/volga-fed-district",
     },
     "germany": {
-        "bavaria": "germany/bayern",
-        "berlin": "germany/berlin",
-        "hamburg": "germany/hamburg",
-        "north rhine-westphalia": "germany/nordrhein-westfalen",
+        "bavaria": "europe/germany/bayern",
+        "berlin": "europe/germany/berlin",
+        "hamburg": "europe/germany/hamburg",
+        "north rhine-westphalia": "europe/germany/nordrhein-westfalen",
     },
     "usa": {
-        "california": "us/california",
-        "new york": "us/new-york",
-        "texas": "us/texas",
-        "florida": "us/florida",
+        "california": "north-america/us/california",
+        "new york": "north-america/us/new-york",
+        "texas": "north-america/us/texas",
+        "florida": "north-america/us/florida",
     },
 }
 
@@ -110,7 +116,7 @@ MIN_RIVER_WIDTH_M = 25   # Минимальная ширина русла для
 
 def check_dependencies():
     """Проверяет наличие необходимых внешних утилит."""
-    console.print("[bold]🔍 Проверка зависимостей...[/bold]")
+    console.print("[bold] Проверка зависимостей...[/bold]")
     
     # Проверка osmium
     try:
@@ -121,16 +127,16 @@ def check_dependencies():
             timeout=5
         )
         if result.returncode != 0:
-            console.print("[red]❌ osmium не установлен[/red]")
+            console.print("[red] osmium не установлен[/red]")
             console.print("   Установите: apt install osmium-tool (Linux)")
             console.print("   Или: brew install osmium-tool (macOS)")
             sys.exit(1)
-        console.print("[green]✓ osmium доступен[/green]")
+        console.print("[green] osmium доступен[/green]")
     except FileNotFoundError:
-        console.print("[red]❌ osmium не найден в PATH[/red]")
+        console.print("[red] osmium не найден в PATH[/red]")
         sys.exit(1)
     except Exception as e:
-        console.print(f"[red]❌ Ошибка проверки osmium: {e}[/red]")
+        console.print(f"[red] Ошибка проверки osmium: {e}[/red]")
         sys.exit(1)
 
 
@@ -139,7 +145,7 @@ def resolve_geofabrik_url(country: str, region: Optional[str] = None) -> str:
     country_lower = country.lower().strip()
     
     if country_lower not in COUNTRY_PATHS:
-        console.print(f"[yellow]⚠ Страна '{country}' не найдена в словаре[/yellow]")
+        console.print(f"[yellow] Страна '{country}' не найдена в словаре[/yellow]")
         console.print(f"[yellow]  Доступные страны: {list(COUNTRY_PATHS.keys())}[/yellow]")
         # Пытаемся сформировать URL по умолчанию
         country_slug = country_lower.replace(" ", "-")
@@ -155,7 +161,7 @@ def resolve_geofabrik_url(country: str, region: Optional[str] = None) -> str:
             path = country_regions[region_lower]
         else:
             console.print(
-                f"[yellow]⚠ Регион '{region}' для '{country}' не найден, "
+                f"[yellow] Регион '{region}' для '{country}' не найден, "
                 f"используется вся страна[/yellow]"
             )
     
@@ -166,39 +172,72 @@ def download_file(
     url: str,
     save_path: Path,
     progress: Progress,
-    task_id: TaskID
+    task_id: TaskID,
+    max_retries: int = 5
 ) -> Path:
     """
-    Синхронная загрузка файла с прогресс-баром.
+    Синхронная загрузка файла с прогресс-баром и автоматическими повторными попытками.
     Запускается в отдельном потоке ThreadPoolExecutor.
     """
-    try:
-        # Запрос с HEAD для получения размера файла
-        head_response = requests.head(url, allow_redirects=True, timeout=30)
-        head_response.raise_for_status()
-        
-        total_size = int(head_response.headers.get('content-length', 0))
-        progress.update(task_id, total=total_size)
-        progress.update(task_id, description=f"⬇️  {save_path.name}")
-        
-        # Скачивание с чанками
-        downloaded = 0
-        with requests.get(url, stream=True, timeout=60) as response:
-            response.raise_for_status()
-            
-            with open(save_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        progress.update(task_id, completed=downloaded)
-        
-        progress.update(task_id, description=f"✓ {save_path.name}")
-        return save_path
-        
-    except requests.exceptions.RequestException as e:
-        progress.update(task_id, description=f"❌ Ошибка: {save_path.name}")
-        raise RuntimeError(f"Ошибка скачивания {url}: {e}")
+    import time
+
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            # Запрос с HEAD для получения размера файла
+            head_response = requests.head(url, allow_redirects=True, timeout=30)
+            head_response.raise_for_status()
+
+            total_size = int(head_response.headers.get('content-length', 0))
+            progress.update(task_id, total=total_size)
+            progress.update(task_id, description=f" {save_path.name}")
+
+            # Скачивание с чанками
+            downloaded = 0
+            with requests.get(url, stream=True, timeout=(30, 300)) as response:
+                response.raise_for_status()
+
+                with open(save_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            progress.update(task_id, completed=downloaded)
+
+            progress.update(task_id, description=f" {save_path.name}")
+            return save_path
+
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            # Удаляем частичный файл
+            if save_path.exists():
+                save_path.unlink()
+
+            # 4xx — ошибка клиента (404: файл не существует), повторять бессмысленно
+            is_http_error = isinstance(e, requests.exceptions.HTTPError)
+            status = getattr(e, 'response', None)
+            if is_http_error and status is not None and 400 <= status.status_code < 500:
+                progress.update(task_id, description=f" Ошибка: {save_path.name}")
+                raise RuntimeError(
+                    f"HTTP {status.status_code} для {url} — файл не существует на Geofabrik. "
+                    f"Проверьте путь (структура сервера могла измениться)."
+                )
+
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # 1s, 2s, 4s, 8s, 16s
+                progress.update(
+                    task_id,
+                    description=f" Повтор {attempt + 1}/{max_retries - 1}: {save_path.name}"
+                )
+                console.print(
+                    f"[yellow] {save_path.name}: {e.__class__.__name__}, "
+                    f"повтор через {wait_time}с...[/yellow]"
+                )
+                time.sleep(wait_time)
+            else:
+                progress.update(task_id, description=f" Ошибка: {save_path.name}")
+                raise RuntimeError(f"Ошибка скачивания {url} после {max_retries} попыток: {e}")
 
 
 def download_all_files(urls: List[str], output_dir: Path) -> List[Path]:
@@ -209,7 +248,7 @@ def download_all_files(urls: List[str], output_dir: Path) -> List[Path]:
     downloaded_files = []
     max_workers = min(len(urls), 4)  # Ограничиваем число потоков
     
-    console.print(f"\n[bold yellow]📥 Скачивание {len(urls)} файл(ов)...[/bold yellow]")
+    console.print(f"\n[bold yellow] Скачивание {len(urls)} файл(ов)...[/bold yellow]")
     
     with Progress(
         TextColumn("[bold blue]{task.description}"),
@@ -233,7 +272,7 @@ def download_all_files(urls: List[str], output_dir: Path) -> List[Path]:
                     downloaded_files.append(save_path)
                     continue
                 
-                task_id = progress.add_task(f"⏳ {filename}", total=None)
+                task_id = progress.add_task(f" {filename}", total=None)
                 future = executor.submit(download_file, url, save_path, progress, task_id)
                 futures[future] = save_path
             
@@ -243,7 +282,7 @@ def download_all_files(urls: List[str], output_dir: Path) -> List[Path]:
                     result = future.result()
                     downloaded_files.append(result)
                 except Exception as e:
-                    console.print(f"[red]❌ Ошибка загрузки: {e}[/red]")
+                    console.print(f"[red] Ошибка загрузки: {e}[/red]")
                     sys.exit(1)
     
     return downloaded_files
@@ -254,7 +293,7 @@ def run_osmium_command(cmd: List[str], description: str = "") -> bool:
     Запуск команды osmium через subprocess.
     """
     if description:
-        console.print(f"[cyan]⚙️  {description}[/cyan]")
+        console.print(f"[cyan] {description}[/cyan]")
     
     try:
         result = subprocess.run(
@@ -266,17 +305,17 @@ def run_osmium_command(cmd: List[str], description: str = "") -> bool:
         )
         
         if result.returncode != 0:
-            console.print(f"[red]❌ Ошибка osmium:[/red]")
+            console.print(f"[red] Ошибка osmium:[/red]")
             console.print(result.stderr)
             return False
         
         return True
         
     except subprocess.TimeoutExpired:
-        console.print("[red]❌ Таймаут выполнения osmium[/red]")
+        console.print("[red] Таймаут выполнения osmium[/red]")
         return False
     except Exception as e:
-        console.print(f"[red]❌ Ошибка запуска osmium: {e}[/red]")
+        console.print(f"[red] Ошибка запуска osmium: {e}[/red]")
         return False
 
 
@@ -287,7 +326,7 @@ def merge_pbf_files(input_files: List[Path], output_file: Path) -> Path:
     if len(input_files) == 1:
         return input_files[0]
     
-    console.print(f"\n[bold yellow]🔗 Объединение {len(input_files)} файлов...[/bold yellow]")
+    console.print(f"\n[bold yellow] Объединение {len(input_files)} файлов...[/bold yellow]")
     
     cmd = ["osmium", "merge"] + [str(f) for f in input_files] + ["-o", str(output_file)]
     
@@ -302,7 +341,7 @@ def filter_pbf_with_osmium(input_file: Path, output_file: Path) -> Path:
     Предварительная фильтрация PBF через osmium tags-filter.
     Оставляет только нужные теги для ускорения дальнейшей обработки.
     """
-    console.print(f"\n[bold yellow]🔍 Предварительная фильтрация через Osmium...[/bold yellow]")
+    console.print(f"\n[bold yellow] Предварительная фильтрация через Osmium...[/bold yellow]")
     
     # Фильтруем по тегам леса, воды и административных границ
     cmd = [
@@ -336,7 +375,7 @@ def filter_pbf_with_osmium(input_file: Path, output_file: Path) -> Path:
     
     # Показать размер результирующего файла
     size_mb = output_file.stat().st_size / (1024 * 1024)
-    console.print(f"[green]✓ Отфильтрованный файл: {size_mb:.1f} MB[/green]")
+    console.print(f"[green] Отфильтрованный файл: {size_mb:.1f} MB[/green]")
     
     return output_file
 
@@ -346,7 +385,7 @@ def extract_bbox(input_file: Path, output_file: Path, bbox: tuple) -> Path:
     Вырезает область по bbox из PBF файла через osmium extract.
     bbox: (min_lon, min_lat, max_lon, max_lat)
     """
-    console.print(f"\n[bold yellow]✂️  Вырезание области по BBOX...[/bold yellow]")
+    console.print(f"\n[bold yellow] Вырезание области по BBOX...[/bold yellow]")
     
     min_lon, min_lat, max_lon, max_lat = bbox
     
@@ -382,21 +421,21 @@ def process_forest_layer(pbf_path: Path, output_path: Path) -> Optional[gpd.GeoD
     """
     try:
         from pyrosm import OSM
-        
-        console.print("[cyan]🌲 Обработка слоя: Лес[/cyan]")
-        
+
+        console.print("[cyan] Обработка слоя: Лес[/cyan]")
+
         # Загрузка данных
         osm = OSM(str(pbf_path))
-        
-        # Получаем полигоны лесов
-        forest_gdf = osm.get_natural("wood")
-        forest_landuse = osm.get_landuse("forest")
-        
+
+        # Получаем полигоны лесов (pyrosm 0.27+: custom_filter — словарь)
+        forest_natural = osm.get_natural(custom_filter={'natural': ['wood']})
+        forest_landuse = osm.get_landuse(custom_filter={'landuse': ['forest']})
+
         # Объединяем, если есть данные
-        gdfs = [gdf for gdf in [forest_gdf, forest_landuse] if gdf is not None and len(gdf) > 0]
-        
+        gdfs = [gdf for gdf in [forest_natural, forest_landuse] if gdf is not None and len(gdf) > 0]
+
         if not gdfs:
-            console.print("[yellow]⚠ Лес не найден[/yellow]")
+            console.print("[yellow] Лес не найден[/yellow]")
             return None
         
         forest = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True))
@@ -418,14 +457,14 @@ def process_forest_layer(pbf_path: Path, output_path: Path) -> Optional[gpd.GeoD
         available_cols = [c for c in columns if c in forest_final.columns]
         forest_final = forest_final[available_cols].reset_index(drop=True)
         
-        console.print(f"[green]✓ Лес: {len(forest_final)} объектов[/green]")
+        console.print(f"[green] Лес: {len(forest_final)} объектов[/green]")
         
         # Сохраняем во временный файл для передачи между процессами
         forest_final.to_file(output_path, driver="GPKG", layer="forest")
         return output_path
         
     except Exception as e:
-        console.print(f"[red]❌ Ошибка обработки леса: {e}[/red]")
+        console.print(f"[red] Ошибка обработки леса: {e}[/red]")
         import traceback
         traceback.print_exc()
         return None
@@ -437,23 +476,26 @@ def process_city_layer(pbf_path: Path, output_path: Path, admin_levels: List[int
     """
     try:
         from pyrosm import OSM
-        
-        console.print("[cyan]🏙️  Обработка слоя: Город[/cyan]")
-        
+
+        console.print("[cyan] Обработка слоя: Город[/cyan]")
+
         osm = OSM(str(pbf_path))
-        
-        # Получаем административные границы
-        boundaries = osm.get_boundaries(admin_level=admin_levels)
-        
+
+        # Получаем административные границы (pyrosm 0.27+: custom_filter — словарь)
+        admin_level_strs = [str(level) for level in admin_levels]
+        boundaries = osm.get_boundaries(
+            custom_filter={'admin_level': admin_level_strs}
+        )
+
         if boundaries is None or len(boundaries) == 0:
-            console.print("[yellow]⚠ Границы городов не найдены[/yellow]")
+            console.print("[yellow] Границы городов не найдены[/yellow]")
             return None
         
         # Фильтруем только полигоны и мультиполигоны
         city = boundaries[boundaries.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
         
         if len(city) == 0:
-            console.print("[yellow]⚠ Полигональные границы не найдены[/yellow]")
+            console.print("[yellow] Полигональные границы не найдены[/yellow]")
             return None
         
         # Выбираем колонки
@@ -461,13 +503,13 @@ def process_city_layer(pbf_path: Path, output_path: Path, admin_levels: List[int
         available_cols = [c for c in columns if c in city.columns]
         city_final = city[available_cols].reset_index(drop=True)
         
-        console.print(f"[green]✓ Города: {len(city_final)} объектов[/green]")
+        console.print(f"[green] Города: {len(city_final)} объектов[/green]")
         
         city_final.to_file(output_path, driver="GPKG", layer="city")
         return output_path
         
     except Exception as e:
-        console.print(f"[red]❌ Ошибка обработки городов: {e}[/red]")
+        console.print(f"[red] Ошибка обработки городов: {e}[/red]")
         import traceback
         traceback.print_exc()
         return None
@@ -482,25 +524,45 @@ def process_water_layer(pbf_path: Path, output_path: Path) -> Optional[Path]:
         from pyrosm import OSM
         import pandas as pd
         from shapely.geometry import MultiPolygon
-        
-        console.print("[cyan]💧 Обработка слоя: Вода[/cyan]")
-        
+
+        console.print("[cyan] Обработка слоя: Вода[/cyan]")
+
         osm = OSM(str(pbf_path))
-        
-        # 1. Получаем полигональную воду
-        water_polygons = osm.get_natural("water")
-        riverbanks = osm.get_natural("riverbank")  # Иногда реки как полигоны
-        
+
+        # 1. Получаем полигональную воду (pyrosm 0.27+: custom_filter — словарь)
+        water_polygons = osm.get_natural(custom_filter={'natural': ['water']})
+
+        # Полигональные берега рек (некоторые реки обозначены как полигоны)
+        # Используем get_data_by_custom_criteria, так как riverbank — это waterway
+        riverbanks = None
+        try:
+            riverbanks = osm.get_data_by_custom_criteria(
+                custom_filter={'waterway': ['riverbank']},
+                keep_ways=True,
+                keep_relations=True,
+                keep_nodes=False
+            )
+        except:
+            pass
+
         poly_gdfs = []
         if water_polygons is not None and len(water_polygons) > 0:
             poly_gdfs.append(water_polygons)
         if riverbanks is not None and len(riverbanks) > 0:
-            poly_gdfs.append(riverbanks)
-        
+            # Фильтруем только полигоны
+            riverbank_polys = riverbanks[riverbanks.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            if len(riverbank_polys) > 0:
+                poly_gdfs.append(riverbank_polys)
+
         # 2. Получаем линейные объекты (реки, каналы)
         water_lines = None
         try:
-            water_lines = osm.get_waterways()
+            water_lines = osm.get_data_by_custom_criteria(
+                custom_filter={'waterway': ['river', 'canal', 'stream']},
+                keep_ways=True,
+                keep_relations=True,
+                keep_nodes=False
+            )
         except:
             pass
         
@@ -512,7 +574,7 @@ def process_water_layer(pbf_path: Path, output_path: Path) -> Optional[Path]:
             all_geoms.append(water_lines)
         
         if not all_geoms:
-            console.print("[yellow]⚠ Вода не найдена[/yellow]")
+            console.print("[yellow] Вода не найдена[/yellow]")
             return None
         
         # Объединяем для определения центроида
@@ -599,7 +661,7 @@ def process_water_layer(pbf_path: Path, output_path: Path) -> Optional[Path]:
             all_water_parts.append(rivers_gdf)
         
         if not all_water_parts:
-            console.print("[yellow]⚠ Вода после фильтрации не найдена[/yellow]")
+            console.print("[yellow] Вода после фильтрации не найдена[/yellow]")
             return None
         
         # Объединяем все в один GeoDataFrame
@@ -627,16 +689,16 @@ def process_water_layer(pbf_path: Path, output_path: Path) -> Optional[Path]:
             # Оставляем только нужные колонки
             water_final = water_final[['area_m2', 'geometry']].reset_index(drop=True)
             
-            console.print(f"[green]✓ Вода: {len(water_final)} объектов[/green]")
+            console.print(f"[green] Вода: {len(water_final)} объектов[/green]")
             
             water_final.to_file(output_path, driver="GPKG", layer="water")
             return output_path
         
-        console.print("[yellow]⚠ Итоговая вода пуста[/yellow]")
+        console.print("[yellow] Итоговая вода пуста[/yellow]")
         return None
         
     except Exception as e:
-        console.print(f"[red]❌ Ошибка обработки воды: {e}[/red]")
+        console.print(f"[red] Ошибка обработки воды: {e}[/red]")
         import traceback
         traceback.print_exc()
         return None
@@ -659,7 +721,7 @@ def run_pipeline(
     Основной pipeline обработки OSM данных.
     """
     console.print(Panel.fit(
-        "[bold blue]🗺️  OSM Data Pipeline для ML[/bold blue]\n"
+        "[bold blue] OSM Data Pipeline для ML[/bold blue]\n"
         "Подготовка векторных масок из OpenStreetMap",
         border_style="blue"
     ))
@@ -674,7 +736,7 @@ def run_pipeline(
         # ========================================
         # ШАГ 1: Формирование списка URL для скачивания
         # ========================================
-        console.print("\n[bold]📍 Шаг 1: Определение источников данных[/bold]")
+        console.print("\n[bold] Шаг 1: Определение источников данных[/bold]")
         
         urls = []
         if countries:
@@ -693,15 +755,24 @@ def run_pipeline(
             url = resolve_geofabrik_url("russia")
             urls.append(url)
             console.print(f"  • По умолчанию (Россия): {url}")
+
+        # Дедупликация: разные регионы могут указывать на один файл (например,
+        # Tula Oblast и Moscow — оба в central-fed-district)
+        unique_urls = list(dict.fromkeys(urls))
+        if len(unique_urls) < len(urls):
+            console.print(
+                f"[dim]  ℹ Дедупликация: {len(urls)} URL → {len(unique_urls)} уникальных файлов[/dim]"
+            )
+        urls = unique_urls
         
         # ========================================
         # ШАГ 2: Скачивание файлов
         # ========================================
-        console.print("\n[bold]📥 Шаг 2: Скачивание данных[/bold]")
+        console.print("\n[bold] Шаг 2: Скачивание данных[/bold]")
         downloaded_files = download_all_files(urls, temp_path)
         
         if not downloaded_files:
-            console.print("[red]❌ Не удалось скачать ни одного файла[/red]")
+            console.print("[red] Не удалось скачать ни одного файла[/red]")
             sys.exit(1)
         
         # ========================================
@@ -729,7 +800,7 @@ def run_pipeline(
         # ========================================
         # ШАГ 6: Обработка слоев в параллельных процессах
         # ========================================
-        console.print(f"\n[bold]🔧 Шаг 3: Обработка геометрии ({workers} ядер)[/bold]")
+        console.print(f"\n[bold] Шаг 3: Обработка геометрии ({workers} ядер)[/bold]")
         
         # Пути для промежуточных результатов
         forest_path = temp_path / "forest.gpkg"
@@ -768,7 +839,7 @@ def run_pipeline(
         # ========================================
         # ШАГ 7: Финальное объединение в единый GeoPackage
         # ========================================
-        console.print(f"\n[bold]💾 Шаг 4: Сохранение результата[/bold]")
+        console.print(f"\n[bold] Шаг 4: Сохранение результата[/bold]")
         
         # Создаем итоговый GeoPackage
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -790,13 +861,13 @@ def run_pipeline(
                         mode=mode
                     )
                     layers_saved.append((layer_name, len(layer_gdf)))
-                    console.print(f"[green]✓ Слой '{layer_name}' сохранен[/green]")
+                    console.print(f"[green] Слой '{layer_name}' сохранен[/green]")
                     
                 except Exception as e:
-                    console.print(f"[red]❌ Ошибка сохранения {layer_name}: {e}[/red]")
+                    console.print(f"[red] Ошибка сохранения {layer_name}: {e}[/red]")
         
         if not layers_saved:
-            console.print("[red]❌ Не удалось сохранить ни одного слоя[/red]")
+            console.print("[red] Не удалось сохранить ни одного слоя[/red]")
             sys.exit(1)
         
         # ========================================
@@ -804,7 +875,7 @@ def run_pipeline(
         # ========================================
         console.print()
         
-        table = Table(title="📊 Результаты обработки", show_header=True)
+        table = Table(title=" Результаты обработки", show_header=True)
         table.add_column("Слой", style="cyan", justify="left")
         table.add_column("Объектов", style="magenta", justify="right")
         table.add_column("Статус", style="green", justify="center")
@@ -813,13 +884,13 @@ def run_pipeline(
             table.add_row(
                 layer_name.capitalize(),
                 f"{count:,}",
-                "✓ Готов"
+                " Готов"
             )
         
         console.print(table)
         
-        console.print(f"\n[bold green]✅ Файл сохранен: {output}[/bold green]")
-        console.print(f"[dim]💡 Откройте в QGIS: qgis {output}[/dim]")
+        console.print(f"\n[bold green] Файл сохранен: {output}[/bold green]")
+        console.print(f"[dim] Откройте в QGIS: qgis {output}[/dim]")
         
         # Временные файлы удалятся автоматически при выходе из with
 
@@ -867,7 +938,7 @@ def run(
     ),
 ):
     """
-    🗺️  Запуск pipeline для подготовки векторных данных OSM для ML.
+    Запуск pipeline для подготовки векторных данных OSM для ML.
     
     Примеры использования:
     
@@ -910,7 +981,7 @@ def run(
                 raise ValueError("Некорректный порядок координат")
                 
         except ValueError as e:
-            console.print(f"[red]❌ Некорректный формат bbox: {e}[/red]")
+            console.print(f"[red] Некорректный формат bbox: {e}[/red]")
             console.print("[yellow]Формат: min_lon,min_lat,max_lon,max_lat[/yellow]")
             console.print("[yellow]Пример: 37.0,55.0,38.0,56.0[/yellow]")
             sys.exit(1)
@@ -927,10 +998,10 @@ def run(
             keep_temp=keep_temp
         )
     except KeyboardInterrupt:
-        console.print("\n[yellow]⚠ Операция прервана пользователем[/yellow]")
+        console.print("\n[yellow] Операция прервана пользователем[/yellow]")
         sys.exit(130)
     except Exception as e:
-        console.print(f"\n[red]❌ Критическая ошибка: {e}[/red]")
+        console.print(f"\n[red] Критическая ошибка: {e}[/red]")
         import traceback
         traceback.print_exc()
         sys.exit(1)
@@ -939,9 +1010,9 @@ def run(
 @app.command()
 def list_countries():
     """
-    📋 Показать список доступных стран и регионов.
+    Показать список доступных стран и регионов.
     """
-    console.print("\n[bold]🌍 Доступные страны:[/bold]\n")
+    console.print("\n[bold] Доступные страны:[/bold]\n")
     
     table = Table(show_header=True)
     table.add_column("Страна", style="cyan")
@@ -958,10 +1029,10 @@ def list_countries():
 
 @app.command()
 def version():
-    """🔢 Показать версию приложения."""
+    """ Показать версию приложения."""
     console.print("[bold blue]OSM Data Pipeline[/bold blue]")
     console.print("Версия: [green]1.0.0[/green]")
-    console.print("Автор: [cyan]OSM ML Team[/cyan]")
+    console.print("Автор: [cyan]Festchuk.dev[/cyan]")
 
 
 # ==========================================
