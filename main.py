@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import tempfile
+import warnings
 
 from rich.console import Console
 from rich.progress import (
@@ -28,6 +29,9 @@ from rich import print as rprint
 import geopandas as gpd
 from shapely.geometry import box
 import pyproj
+
+# Подавляем предупреждения pyrosm и progress bar tqdm
+warnings.filterwarnings("ignore", category=UserWarning, module="pyrosm")
 
 app = typer.Typer(
     name="osm-pipeline",
@@ -336,14 +340,21 @@ def merge_pbf_files(input_files: List[Path], output_file: Path) -> Path:
     return output_file
 
 
-def filter_pbf_with_osmium(input_file: Path, output_file: Path) -> Path:
+def filter_pbf_with_osmium(
+    input_file: Path,
+    output_file: Path,
+    place_types: List[str],
+    include_residential: bool = False,
+    include_industrial: bool = False,
+    include_commercial: bool = False
+) -> Path:
     """
     Предварительная фильтрация PBF через osmium tags-filter.
     Оставляет только нужные теги для ускорения дальнейшей обработки.
     """
     console.print(f"\n[bold yellow] Предварительная фильтрация через Osmium...[/bold yellow]")
-    
-    # Фильтруем по тегам леса, воды и административных границ
+
+    # Фильтруем по тегам леса, воды и границ населённых пунктов
     cmd = [
         "osmium", "tags-filter",
         str(input_file),
@@ -359,16 +370,28 @@ def filter_pbf_with_osmium(input_file: Path, output_file: Path) -> Path:
         "w/waterway=canal",
         "w/waterway=stream",
         "wr/natural=water",
-        # Города
+        # Административные границы (фильтрация по admin_level — на этапе обработки)
         "w/boundary=administrative",
         "wr/boundary=administrative",
-        # Населенные пункты
-        "n/place=city",
-        "n/place=town",
-        "n/place=village",
-        "-o", str(output_file),
-        "--overwrite"
     ]
+
+    # Населённые пункты: place-полигоны (way/relation), типы из CLI
+    for place_type in place_types:
+        cmd.append(f"wr/place={place_type}")
+
+    # Жилые зоны (опционально)
+    if include_residential:
+        cmd.append("wr/landuse=residential")
+
+    # Промзоны (опционально)
+    if include_industrial:
+        cmd.append("wr/landuse=industrial")
+
+    # Коммерческие зоны (опционально)
+    if include_commercial:
+        cmd.append("wr/landuse=commercial")
+
+    cmd += ["-o", str(output_file), "--overwrite"]
     
     if not run_osmium_command(cmd, "Фильтрация тегов"):
         raise RuntimeError("Не удалось отфильтровать PBF файл")
@@ -420,11 +443,14 @@ def process_forest_layer(pbf_path: Path, output_path: Path) -> Optional[gpd.GeoD
     Загружается в отдельном процессе через ProcessPoolExecutor.
     """
     try:
+        import warnings
+        warnings.filterwarnings("ignore", category=UserWarning, module="pyrosm")
         from pyrosm import OSM
 
         console.print("[cyan] Обработка слоя: Лес[/cyan]")
 
-        # Загрузка данных
+        # Отключаем tqdm progress bar (он уже есть в Rich)
+        os.environ['TQDM_DISABLE'] = '1'
         osm = OSM(str(pbf_path))
 
         # Получаем полигоны лесов (pyrosm 0.27+: custom_filter — словарь)
@@ -470,46 +496,152 @@ def process_forest_layer(pbf_path: Path, output_path: Path) -> Optional[gpd.GeoD
         return None
 
 
-def process_city_layer(pbf_path: Path, output_path: Path, admin_levels: List[int]) -> Optional[Path]:
+def process_city_layer(
+    pbf_path: Path,
+    output_path: Path,
+    admin_levels: List[int],
+    place_types: List[str],
+    include_residential: bool = False,
+    include_industrial: bool = False,
+    include_commercial: bool = False
+) -> Optional[Path]:
     """
-    Обработка слоя "Город" (административные границы).
+    Обработка слоя "Населённые пункты" — точные границы (черта города/деревни/посёлка).
+    Источники:
+    1. Административные границы указанных уровней (по умолчанию admin_level=10)
+    2. Полигоны place=<типы из CLI>
+    3. (опционально) Жилые зоны landuse=residential
+    4. (опционально) Промзоны landuse=industrial
+    5. (опционально) Коммерческие зоны landuse=commercial
     """
     try:
+        import warnings
+        warnings.filterwarnings("ignore", category=UserWarning, module="pyrosm")
         from pyrosm import OSM
 
-        console.print("[cyan] Обработка слоя: Город[/cyan]")
+        console.print("[cyan] Обработка слоя: Населённые пункты[/cyan]")
 
+        # Отключаем tqdm progress bar (он уже есть в Rich)
+        os.environ['TQDM_DISABLE'] = '1'
         osm = OSM(str(pbf_path))
 
-        # Получаем административные границы (pyrosm 0.27+: custom_filter — словарь)
-        admin_level_strs = [str(level) for level in admin_levels]
-        boundaries = osm.get_boundaries(
-            custom_filter={'admin_level': admin_level_strs}
-        )
+        def _polygons_only(gdf):
+            if gdf is None or len(gdf) == 0:
+                return None
+            polys = gdf[gdf.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
+            return polys if len(polys) > 0 else None
 
-        if boundaries is None or len(boundaries) == 0:
-            console.print("[yellow] Границы городов не найдены[/yellow]")
+        gdfs = []
+
+        # 1. Административные границы (по умолчанию admin_level=10 — черта НП)
+        try:
+            admin_boundaries = osm.get_boundaries(
+                custom_filter={'admin_level': [str(l) for l in admin_levels]}
+            )
+            admin_polys = _polygons_only(admin_boundaries)
+            if admin_polys is not None:
+                gdfs.append(admin_polys)
+                console.print(
+                    f"[dim]  • Админ. границы (уровни {admin_levels}): "
+                    f"{len(admin_polys)} объектов[/dim]"
+                )
+        except Exception as e:
+            console.print(f"[yellow]⚠ Ошибка загрузки админ. границ: {e}[/yellow]")
+
+        # 2. Полигоны place=* (замкнутые контуры городов/деревень)
+        try:
+            place_polys = _polygons_only(osm.get_data_by_custom_criteria(
+                custom_filter={'place': list(place_types)},
+                tags_as_columns=['name'],
+                keep_ways=True,
+                keep_relations=True,
+                keep_nodes=False
+            ))
+            if place_polys is not None:
+                gdfs.append(place_polys)
+                console.print(
+                    f"[dim]  • Place-полигоны ({', '.join(place_types)}): "
+                    f"{len(place_polys)} объектов[/dim]"
+                )
+        except Exception as e:
+            console.print(f"[yellow]⚠ Ошибка загрузки place-полигонов: {e}[/yellow]")
+
+        # 3. Жилые зоны landuse=residential (опционально)
+        if include_residential:
+            try:
+                residential_polys = _polygons_only(
+                    osm.get_landuse(
+                        custom_filter={'landuse': ['residential']},
+                        extra_attributes=['name']
+                    )
+                )
+                if residential_polys is not None:
+                    gdfs.append(residential_polys)
+                    console.print(
+                        f"[dim]  • Жилые зоны (landuse=residential): "
+                        f"{len(residential_polys)} объектов[/dim]"
+                    )
+            except Exception as e:
+                console.print(f"[yellow]⚠ Ошибка загрузки residential: {e}[/yellow]")
+
+        # 4. Промзоны landuse=industrial (опционально)
+        if include_industrial:
+            try:
+                industrial_polys = _polygons_only(
+                    osm.get_landuse(
+                        custom_filter={'landuse': ['industrial']},
+                        extra_attributes=['name']
+                    )
+                )
+                if industrial_polys is not None:
+                    gdfs.append(industrial_polys)
+                    console.print(
+                        f"[dim]  • Промзоны (landuse=industrial): "
+                        f"{len(industrial_polys)} объектов[/dim]"
+                    )
+            except Exception as e:
+                console.print(f"[yellow]⚠ Ошибка загрузки industrial: {e}[/yellow]")
+
+        # 5. Коммерческие зоны landuse=commercial (опционально)
+        if include_commercial:
+            try:
+                commercial_polys = _polygons_only(
+                    osm.get_landuse(
+                        custom_filter={'landuse': ['commercial']},
+                        extra_attributes=['name']
+                    )
+                )
+                if commercial_polys is not None:
+                    gdfs.append(commercial_polys)
+                    console.print(
+                        f"[dim]  • Коммерческие зоны (landuse=commercial): "
+                        f"{len(commercial_polys)} объектов[/dim]"
+                    )
+            except Exception as e:
+                console.print(f"[yellow]⚠ Ошибка загрузки commercial: {e}[/yellow]")
+
+        if not gdfs:
+            console.print("[yellow]⚠ Населённые пункты не найдены[/yellow]")
             return None
-        
-        # Фильтруем только полигоны и мультиполигоны
-        city = boundaries[boundaries.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
-        
-        if len(city) == 0:
-            console.print("[yellow] Полигональные границы не найдены[/yellow]")
-            return None
-        
-        # Выбираем колонки
-        columns = ['id', 'name', 'admin_level', 'geometry']
+
+        city = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True))
+
+        # Выбираем колонки (у разных источников заполнены разные поля)
+        columns = ['id', 'name', 'admin_level', 'place', 'geometry']
         available_cols = [c for c in columns if c in city.columns]
         city_final = city[available_cols].reset_index(drop=True)
-        
-        console.print(f"[green] Города: {len(city_final)} объектов[/green]")
-        
+
+        # Конвертируем admin_level в int (pyrosm возвращает строку)
+        if 'admin_level' in city_final.columns:
+            city_final['admin_level'] = pd.to_numeric(city_final['admin_level'], errors='coerce')
+
+        console.print(f"[green] Населённые пункты: {len(city_final)} объектов[/green]")
+
         city_final.to_file(output_path, driver="GPKG", layer="city")
         return output_path
-        
+
     except Exception as e:
-        console.print(f"[red] Ошибка обработки городов: {e}[/red]")
+        console.print(f"[red] Ошибка обработки населённых пунктов: {e}[/red]")
         import traceback
         traceback.print_exc()
         return None
@@ -521,12 +653,16 @@ def process_water_layer(pbf_path: Path, output_path: Path) -> Optional[Path]:
     Объединяет полигональные водоемы (>= 2500 м²) и линейные реки (width >= 25м).
     """
     try:
+        import warnings
+        warnings.filterwarnings("ignore", category=UserWarning, module="pyrosm")
         from pyrosm import OSM
         import pandas as pd
         from shapely.geometry import MultiPolygon
 
         console.print("[cyan] Обработка слоя: Вода[/cyan]")
 
+        # Отключаем tqdm progress bar (он уже есть в Rich)
+        os.environ['TQDM_DISABLE'] = '1'
         osm = OSM(str(pbf_path))
 
         # 1. Получаем полигональную воду (pyrosm 0.27+: custom_filter — словарь)
@@ -715,6 +851,10 @@ def run_pipeline(
     output: Path,
     workers: int,
     admin_levels: List[int],
+    place_types: List[str],
+    include_residential: bool,
+    include_industrial: bool,
+    include_commercial: bool,
     keep_temp: bool
 ):
     """
@@ -795,18 +935,21 @@ def run_pipeline(
         # ШАГ 5: Предварительная фильтрация через Osmium
         # ========================================
         filtered_pbf = temp_path / "filtered.osm.pbf"
-        current_pbf = filter_pbf_with_osmium(current_pbf, filtered_pbf)
-        
+        current_pbf = filter_pbf_with_osmium(
+            current_pbf, filtered_pbf, place_types,
+            include_residential, include_industrial, include_commercial
+        )
+
         # ========================================
         # ШАГ 6: Обработка слоев в параллельных процессах
         # ========================================
         console.print(f"\n[bold] Шаг 3: Обработка геометрии ({workers} ядер)[/bold]")
-        
+
         # Пути для промежуточных результатов
         forest_path = temp_path / "forest.gpkg"
         water_path = temp_path / "water.gpkg"
         city_path = temp_path / "city.gpkg"
-        
+
         # Запускаем обработку в пуле процессов
         with ProcessPoolExecutor(max_workers=workers) as pool:
             # Отправляем задачи параллельно
@@ -815,20 +958,24 @@ def run_pipeline(
                 current_pbf,
                 forest_path
             )
-            
+
             future_water = pool.submit(
                 process_water_layer,
                 current_pbf,
                 water_path
             )
-            
+
             future_city = pool.submit(
                 process_city_layer,
                 current_pbf,
                 city_path,
-                admin_levels
+                admin_levels,
+                place_types,
+                include_residential,
+                include_industrial,
+                include_commercial
             )
-            
+
             # Ожидаем завершения всех задач
             results = {
                 'forest': future_forest.result(),
@@ -927,9 +1074,32 @@ def run(
         help="Количество ядер CPU для параллельной обработки"
     ),
     admin_levels: List[int] = typer.Option(
-        [6, 8],
+        [10],
         "--admin-level",
-        help="Уровни административных границ для городов (по умолчанию 6,8 для РФ)"
+        help="Уровни админ. границ населённых пунктов (10 — черта города/деревни; "
+             "можно указывать несколько раз, например --admin-level 8 --admin-level 10)"
+    ),
+    place_types: List[str] = typer.Option(
+        ["city", "town", "village", "suburb", "hamlet", "other"],
+        "--place-type",
+        help="Типы place-полигонов населённых пунктов (можно указывать несколько раз; "
+             "перечислите нужные, чтобы отключить остальные, например "
+             "--place-type city --place-type town)"
+    ),
+    residential: bool = typer.Option(
+        False,
+        "--residential/--no-residential",
+        help="Добавить жилые зоны landuse=residential третьим источником границ"
+    ),
+    industrial: bool = typer.Option(
+        False,
+        "--industrial/--no-industrial",
+        help="Добавить промзоны landuse=industrial четвёртым источником границ"
+    ),
+    commercial: bool = typer.Option(
+        False,
+        "--commercial/--no-commercial",
+        help="Добавить коммерческие зоны landuse=commercial пятым источником границ"
     ),
     keep_temp: bool = typer.Option(
         False,
@@ -939,25 +1109,33 @@ def run(
 ):
     """
     Запуск pipeline для подготовки векторных данных OSM для ML.
-    
+
     Примеры использования:
-    
+
     \b
     # Скачать всю Россию
     python main.py run
-    
+
     \b
     # Скачать несколько стран
     python main.py run --country Russia --country Germany
-    
+
     \b
     # Скачать конкретные регионы
     python main.py run --country Russia --region "Tula Oblast" --region "Moscow"
-    
+
     \b
     # Скачать по bbox
     python main.py run --country Russia --bbox "37.0,55.0,38.0,56.0"
-    
+
+    \b
+    # Точные границы НП: admin_level 8+10 и только города с посёлками
+    python main.py run --country Russia --admin-level 8 --admin-level 10 --place-type city --place-type town
+
+    \b
+    # С жилыми зонами landuse=residential
+    python main.py run --country Russia --residential
+
     \b
     # Задать свой output и больше ядер
     python main.py run --country Russia --output ./my_data.gpkg --workers 8
@@ -995,6 +1173,10 @@ def run(
             output=output,
             workers=workers,
             admin_levels=admin_levels,
+            place_types=place_types,
+            include_residential=residential,
+            include_industrial=industrial,
+            include_commercial=commercial,
             keep_temp=keep_temp
         )
     except KeyboardInterrupt:

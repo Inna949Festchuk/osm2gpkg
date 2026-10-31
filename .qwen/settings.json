@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(.venv/bin/python *)",
-      "Bash(cd *)"
+      "Bash(cd *)",
+      "Bash(rm *)",
+      "Bash(mkdir *)",
+      "Bash(osmium *)",
+      "Bash(/home/mygis/документы/osm2gpkg/.venv/bin/python *)"
     ]
   },
   "$version": 4
